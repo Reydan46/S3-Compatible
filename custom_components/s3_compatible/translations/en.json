@@ -1,13 +1,14 @@
 {
   "config": {
     "abort": {
-      "already_configured": "Account is already configured"
+      "already_configured": "Bucket is already configured for this endpoint"
     },
     "error": {
       "cannot_connect": "Cannot connect to endpoint",
       "invalid_bucket_name": "Invalid bucket name",
-      "invalid_credentials": "Bucket cannot be accessed using provided combination of access key ID and secret access key",
-      "invalid_endpoint_url": "Invalid endpoint URL. Please make sure it's a valid AWS S3 endpoint URL."
+      "invalid_credentials": "Bucket cannot be accessed using the provided access key ID and secret access key",
+      "invalid_endpoint_url": "Invalid endpoint URL. Enter the S3 API endpoint without the bucket name.",
+      "unknown": "Unexpected error"
     },
     "step": {
       "user": {
@@ -15,21 +16,40 @@
           "access_key_id": "Access key ID",
           "bucket": "Bucket name",
           "endpoint_url": "Endpoint URL",
+          "addressing_style": "Addressing style",
           "secret_access_key": "Secret access key",
           "region": "Region",
           "prefix": "Prefix",
-          "verify": "Path to a pem file"
+          "verify": "Path to a PEM CA file"
         },
         "data_description": {
-          "access_key_id": "Access key ID to connect to AWS S3 API",
-          "bucket": "Bucket must already exist and be writable by the provided credentials.",
-          "endpoint_url": "Endpoint URL provided to [Boto3 Session]({boto3_docs_url}). Region-specific [AWS S3 endpoints]({aws_s3_docs_url}) are available in their docs.",
-          "secret_access_key": "Secret access key to connect to AWS S3 API",
-          "region": "For most self-hosted solutions, this can be set to anything you want and is unused",
-          "prefix": "Prefix to be added to every key. This can be used to emulate a directory layout with 'foo/'",
-          "verify": "This is only used if you are using a custom CA for the S3 host. Most people will want to leave this blank"
+          "access_key_id": "Access key ID for the S3 API.",
+          "bucket": "Bucket must already exist and be accessible with the provided credentials. Do not include the bucket in the endpoint URL.",
+          "endpoint_url": "S3 API endpoint URL, for example https://s3.example.com. Do not append the bucket name. See [Boto3 Session]({boto3_docs_url}) and [AWS S3 endpoints]({aws_s3_docs_url}).",
+          "addressing_style": "Use path for providers such as Garage that expect endpoint/bucket/key. Use virtual for bucket.endpoint/key. Auto lets botocore decide.",
+          "secret_access_key": "Secret access key for the S3 API.",
+          "region": "S3 signing region. For many self-hosted providers this can be us-east-1 or any provider-specific value.",
+          "prefix": "Optional key prefix inside the bucket, for example homeassistant/. This is not a URL path and should not start with /.",
+          "verify": "Optional path to a PEM CA file for custom TLS certificates. Leave blank for the system trust store."
         },
-        "title": "Add AWS S3 bucket"
+        "title": "Add S3-compatible backup bucket"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "addressing_style": "Addressing style",
+          "prefix": "Prefix",
+          "verify": "Path to a PEM CA file"
+        },
+        "data_description": {
+          "addressing_style": "Use path for providers such as Garage that expect endpoint/bucket/key. Use virtual for bucket.endpoint/key. Auto lets botocore decide.",
+          "prefix": "Optional key prefix inside the bucket, for example homeassistant/. This is not a URL path and should not start with /.",
+          "verify": "Optional path to a PEM CA file for custom TLS certificates. Leave blank for the system trust store."
+        },
+        "title": "S3-compatible backup options"
       }
     }
   },
@@ -41,7 +61,10 @@
       "message": "Invalid bucket name"
     },
     "invalid_credentials": {
-      "message": "Bucket cannot be accessed using provided combination of access key ID and secret access key."
+      "message": "Bucket cannot be accessed using the provided access key ID and secret access key."
+    },
+    "invalid_endpoint_url": {
+      "message": "Invalid endpoint URL"
     }
   }
 }

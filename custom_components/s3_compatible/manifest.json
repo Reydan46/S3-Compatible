@@ -2,17 +2,15 @@
   "domain": "s3_compatible",
   "name": "S3 Compatible",
   "codeowners": [
-    "@PhantomPhoton"
+    "@Reydan46"
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/PhantomPhoton/S3-Compatible",
+  "documentation": "https://github.com/Reydan46/S3-Compatible",
   "iot_class": "cloud_push",
-  "issue_tracker": "https://github.com/PhantomPhoton/S3-Compatible/issues",
-  "loggers": ["aiobotocore"],
+  "issue_tracker": "https://github.com/Reydan46/S3-Compatible/issues",
+  "loggers": ["botocore"],
   "quality_scale": "bronze",
-  "requirements": [
-    "aiobotocore>=3.4.2"
-  ],
-  "version": "1.0.8"
+  "requirements": [],
+  "version": "1.0.9"
 }

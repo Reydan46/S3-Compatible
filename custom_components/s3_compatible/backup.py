@@ -7,8 +7,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine
 from time import time
 from typing import Any, TYPE_CHECKING
 
-from aiobotocore.session import get_session
-from botocore.exceptions import BotoCoreError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from homeassistant.components.backup import (
     AgentBackup,
@@ -20,31 +19,34 @@ from homeassistant.components.backup import (
 from homeassistant.core import HomeAssistant, callback
 
 from .const import (
-    BOTO_CONFIG,
+    CACHE_TTL,
+    CONF_ACCESS_KEY_ID,
+    CONF_ADDRESSING_STYLE,
     CONF_BUCKET,
+    CONF_ENDPOINT_URL,
     CONF_PREFIX,
     CONF_REGION,
-    DATA_BACKUP_AGENT_LISTENERS,
-    DOMAIN,
-    CONF_ACCESS_KEY_ID,
     CONF_SECRET_ACCESS_KEY,
-    CONF_ENDPOINT_URL,
     CONF_VERIFY,
+    DATA_BACKUP_AGENT_LISTENERS,
+    DEFAULT_ADDRESSING_STYLE,
+    DOMAIN,
+    DOWNLOAD_CHUNK_SIZE_BYTES,
+    MULTIPART_MIN_PART_SIZE_BYTES,
+)
+from .helpers import (
+    create_s3_client,
+    normalize_addressing_style,
+    normalize_endpoint_url,
+    normalize_prefix,
 )
 
 if TYPE_CHECKING:
     from . import S3ConfigEntry
-    from aiobotocore.session import ClientCreatorContext
 
 
 _LOGGER = logging.getLogger(__name__)
-CACHE_TTL = 300
-
-# S3 part size requirements: 5 MiB to 5 GiB per part
-# https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-# We set the threshold to 20 MiB to avoid too many parts.
-# Note that each part is allocated in the memory.
-MULTIPART_MIN_PART_SIZE_BYTES = 20 * 2**20
+S3_CLIENT_ERRORS = (BotoCoreError, ClientError)
 
 
 def handle_boto_errors[T](
@@ -57,6 +59,19 @@ def handle_boto_errors[T](
         """Catch BotoCoreError and raise BackupAgentError."""
         try:
             return await func(*args, **kwargs)
+        except ClientError as err:
+            response_metadata = err.response.get("ResponseMetadata", {})
+            error = err.response.get("Error", {})
+            _LOGGER.error(
+                "S3 error during %s: operation=%s code=%s status=%s message=%s",
+                func.__name__,
+                err.operation_name,
+                error.get("Code"),
+                response_metadata.get("HTTPStatusCode"),
+                error.get("Message"),
+            )
+            error_msg = f"Failed during {func.__name__}"
+            raise BackupAgentError(error_msg) from err
         except BotoCoreError as err:
             error_msg = f"Failed during {func.__name__}"
             raise BackupAgentError(error_msg) from err
@@ -109,30 +124,48 @@ class S3BackupAgent(BackupAgent):
     def __init__(self, hass: HomeAssistant, entry: "S3ConfigEntry") -> None:
         """Initialize the S3 agent."""
         super().__init__()
-        self._session = get_session()
-        self._session.set_credentials(
-            access_key=entry.data[CONF_ACCESS_KEY_ID],
-            secret_key=entry.data[CONF_SECRET_ACCESS_KEY],
-        )
-        self._endpoint_url = entry.data.get(CONF_ENDPOINT_URL)
+        self.hass = hass
+        self._access_key_id = entry.data[CONF_ACCESS_KEY_ID]
+        self._secret_access_key = entry.data[CONF_SECRET_ACCESS_KEY]
+        self._endpoint_url = normalize_endpoint_url(entry.data.get(CONF_ENDPOINT_URL))
         self._region = entry.data.get(CONF_REGION)
+        self._addressing_style: str = normalize_addressing_style(
+            entry.options.get(
+                CONF_ADDRESSING_STYLE,
+                entry.data.get(CONF_ADDRESSING_STYLE, DEFAULT_ADDRESSING_STYLE),
+            )
+        )
 
         self._bucket: str = entry.data[CONF_BUCKET]
-        self._prefix: str = entry.data.get(CONF_PREFIX, "")
-        self._verify: str = entry.data.get(CONF_VERIFY, None)
+        self._prefix: str = normalize_prefix(
+            entry.options.get(CONF_PREFIX, entry.data.get(CONF_PREFIX, ""))
+        )
+        self._verify: str = (
+            entry.options.get(CONF_VERIFY, entry.data.get(CONF_VERIFY, "")) or ""
+        ).strip()
 
         self.name = entry.title
         self.unique_id = entry.entry_id
         self._backup_cache: dict[str, AgentBackup] = {}
         self._cache_expiration = time()
+        _LOGGER.info(
+            "Initialized S3 backup agent: endpoint=%s bucket=%s region=%s prefix=%r addressing_style=%s",
+            self._endpoint_url,
+            self._bucket,
+            self._region,
+            self._prefix,
+            self._addressing_style,
+        )
 
-    def _create_client(self) -> "ClientCreatorContext":
-        return self._session.create_client(
-            "s3",
+    def _create_sync_client(self):
+        """Create a synchronous S3 client for executor jobs."""
+        return create_s3_client(
             endpoint_url=self._endpoint_url,
             region_name=self._region,
-            config=BOTO_CONFIG,
-            verify=self._verify if self._verify != "" else None,
+            access_key_id=self._access_key_id,
+            secret_access_key=self._secret_access_key,
+            addressing_style=self._addressing_style,
+            verify=self._verify or None,
         )
 
     @handle_boto_errors
@@ -149,10 +182,39 @@ class S3BackupAgent(BackupAgent):
         backup = await self._find_backup_by_id(backup_id)
         tar_filename, _ = suggested_filenames(backup, self._prefix)
 
-        async with self._create_client() as client:
-            response = await client.get_object(Bucket=self._bucket, Key=tar_filename)
-        return response["Body"].iter_chunks()
+        client = await self.hass.async_add_executor_job(self._create_sync_client)
+        try:
+            response = await self.hass.async_add_executor_job(
+                self._get_object_sync,
+                client,
+                tar_filename,
+            )
+        except S3_CLIENT_ERRORS:
+            await self.hass.async_add_executor_job(client.close)
+            raise
 
+        return self._download_backup_chunks(client, response["Body"])
+
+    async def _download_backup_chunks(self, client: Any, body: Any) -> AsyncIterator[bytes]:
+        """Download a backup as chunks without blocking the event loop."""
+        try:
+            try:
+                while chunk := await self.hass.async_add_executor_job(
+                    body.read,
+                    DOWNLOAD_CHUNK_SIZE_BYTES,
+                ):
+                    yield chunk
+            except S3_CLIENT_ERRORS as err:
+                raise BackupAgentError("Failed during async_download_backup") from err
+        finally:
+            await self.hass.async_add_executor_job(body.close)
+            await self.hass.async_add_executor_job(client.close)
+
+    def _get_object_sync(self, client: Any, key: str) -> dict[str, Any]:
+        """Get an object synchronously. Must be called from an executor job."""
+        return client.get_object(Bucket=self._bucket, Key=key)
+
+    @handle_boto_errors
     async def async_upload_backup(
         self,
         *,
@@ -167,25 +229,19 @@ class S3BackupAgent(BackupAgent):
         """
         tar_filename, metadata_filename = suggested_filenames(backup, self._prefix)
 
-        try:
-            if backup.size < MULTIPART_MIN_PART_SIZE_BYTES:
-                await self._upload_simple(tar_filename, open_stream)
-            else:
-                await self._upload_multipart(tar_filename, open_stream)
-
-            # Upload the metadata file
-            metadata_content = json.dumps(backup.as_dict())
-            async with self._create_client() as client:
-                await client.put_object(
-                    Bucket=self._bucket,
-                    Key=metadata_filename,
-                    Body=metadata_content,
-                )
-        except BotoCoreError as err:
-            raise BackupAgentError("Failed to upload backup") from err
+        if backup.size < MULTIPART_MIN_PART_SIZE_BYTES:
+            await self._upload_simple(tar_filename, open_stream)
         else:
-            # Reset cache after successful upload
-            self._cache_expiration = time()
+            await self._upload_multipart(tar_filename, open_stream)
+
+        # Upload the metadata file
+        metadata_content = json.dumps(backup.as_dict())
+        await self.hass.async_add_executor_job(
+            self._put_object_sync,
+            metadata_filename,
+            metadata_content,
+        )
+        self._invalidate_cache()
 
     async def _upload_simple(
         self,
@@ -203,12 +259,11 @@ class S3BackupAgent(BackupAgent):
         async for chunk in stream:
             file_data.extend(chunk)
 
-        async with self._create_client() as client:
-            await client.put_object(
-                Bucket=self._bucket,
-                Key=tar_filename,
-                Body=bytes(file_data),
-            )
+        await self.hass.async_add_executor_job(
+            self._put_object_sync,
+            tar_filename,
+            bytes(file_data),
+        )
 
     async def _upload_multipart(
         self,
@@ -222,81 +277,149 @@ class S3BackupAgent(BackupAgent):
         """
         _LOGGER.info("Starting multipart upload for %s", tar_filename)
 
-        async with self._create_client() as client:
-            multipart_upload = await client.create_multipart_upload(
-                Bucket=self._bucket,
-                Key=tar_filename,
-            )
+        upload_id = await self.hass.async_add_executor_job(
+            self._create_multipart_upload_sync,
+            tar_filename,
+        )
+        try:
+            parts = []
+            part_number = 1
+            buffer_size = 0  # bytes
+            buffer: bytearray = bytearray()
 
-            upload_id = multipart_upload["UploadId"]
-            try:
-                parts = []
-                part_number = 1
-                buffer_size = 0  # bytes
-                buffer: bytearray = bytearray()
+            stream = await open_stream()
+            async for chunk in stream:
+                buffer.extend(chunk)
+                buffer_size = len(buffer)
 
-                stream = await open_stream()
-                async for chunk in stream:
-                    buffer.extend(chunk)
+                # If buffer size meets minimum part size, upload it as a part
+                if buffer_size >= MULTIPART_MIN_PART_SIZE_BYTES:
+                    # Mega S4 requires all parts to be exactly the same size
+                    overflow = buffer[MULTIPART_MIN_PART_SIZE_BYTES:]
+                    buffer = buffer[:MULTIPART_MIN_PART_SIZE_BYTES]
                     buffer_size = len(buffer)
 
-                    # If buffer size meets minimum part size, upload it as a part
-                    if buffer_size >= MULTIPART_MIN_PART_SIZE_BYTES:
-                        # Mega S4 requires all parts to be exactly the same size
-                        overflow = buffer[MULTIPART_MIN_PART_SIZE_BYTES:]
-                        buffer = buffer[:MULTIPART_MIN_PART_SIZE_BYTES]
-                        buffer_size = len(buffer)
-
-                        _LOGGER.info(
-                            "Uploading part number %d, size %d",
-                            part_number,
-                            buffer_size,
-                        )
-                        part = await client.upload_part(
-                            Bucket=self._bucket,
-                            Key=tar_filename,
-                            PartNumber=part_number,
-                            UploadId=upload_id,
-                            Body=buffer,
-                        )
-                        parts.append({"PartNumber": part_number, "ETag": part["ETag"]})
-                        part_number += 1
-                        buffer = overflow
-                        buffer_size = len(buffer)
-
-                # Upload the final buffer as the last part (no minimum size requirement)
-                if buffer:
                     _LOGGER.info(
-                        "Uploading final part number %d, size %d",
+                        "Uploading part number %d, size %d",
                         part_number,
                         buffer_size,
                     )
-                    part = await client.upload_part(
-                        Bucket=self._bucket,
-                        Key=tar_filename,
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=buffer,
+                    etag = await self.hass.async_add_executor_job(
+                        self._upload_part_sync,
+                        tar_filename,
+                        upload_id,
+                        part_number,
+                        bytes(buffer),
                     )
-                    parts.append({"PartNumber": part_number, "ETag": part["ETag"]})
+                    parts.append({"PartNumber": part_number, "ETag": etag})
+                    part_number += 1
+                    buffer = overflow
+                    buffer_size = len(buffer)
 
-                await client.complete_multipart_upload(
-                    Bucket=self._bucket,
-                    Key=tar_filename,
-                    UploadId=upload_id,
-                    MultipartUpload={"Parts": parts},
+            # Upload the final buffer as the last part (no minimum size requirement)
+            if buffer:
+                _LOGGER.info(
+                    "Uploading final part number %d, size %d",
+                    part_number,
+                    buffer_size,
                 )
+                etag = await self.hass.async_add_executor_job(
+                    self._upload_part_sync,
+                    tar_filename,
+                    upload_id,
+                    part_number,
+                    bytes(buffer),
+                )
+                parts.append({"PartNumber": part_number, "ETag": etag})
 
-            except BotoCoreError:
-                try:
-                    await client.abort_multipart_upload(
-                        Bucket=self._bucket,
-                        Key=tar_filename,
-                        UploadId=upload_id,
-                    )
-                except BotoCoreError:
-                    _LOGGER.exception("Failed to abort multipart upload")
-                raise
+            await self.hass.async_add_executor_job(
+                self._complete_multipart_upload_sync,
+                tar_filename,
+                upload_id,
+                parts,
+            )
+
+        except S3_CLIENT_ERRORS:
+            try:
+                await self.hass.async_add_executor_job(
+                    self._abort_multipart_upload_sync,
+                    tar_filename,
+                    upload_id,
+                )
+            except S3_CLIENT_ERRORS:
+                _LOGGER.exception("Failed to abort multipart upload")
+            raise
+
+    def _put_object_sync(self, key: str, body: bytes | str) -> None:
+        """Upload an object synchronously. Must be called from an executor job."""
+        client = self._create_sync_client()
+        try:
+            client.put_object(Bucket=self._bucket, Key=key, Body=body)
+        finally:
+            client.close()
+
+    def _create_multipart_upload_sync(self, key: str) -> str:
+        """Create multipart upload synchronously. Must be called from an executor job."""
+        client = self._create_sync_client()
+        try:
+            multipart_upload = client.create_multipart_upload(
+                Bucket=self._bucket,
+                Key=key,
+            )
+            return multipart_upload["UploadId"]
+        finally:
+            client.close()
+
+    def _upload_part_sync(
+        self,
+        key: str,
+        upload_id: str,
+        part_number: int,
+        body: bytes,
+    ) -> str:
+        """Upload a multipart part synchronously. Must be called from an executor job."""
+        client = self._create_sync_client()
+        try:
+            part = client.upload_part(
+                Bucket=self._bucket,
+                Key=key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=body,
+            )
+            return part["ETag"]
+        finally:
+            client.close()
+
+    def _complete_multipart_upload_sync(
+        self,
+        key: str,
+        upload_id: str,
+        parts: list[dict[str, Any]],
+    ) -> None:
+        """Complete multipart upload synchronously. Must be called from an executor job."""
+        client = self._create_sync_client()
+        try:
+            client.complete_multipart_upload(
+                Bucket=self._bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        finally:
+            client.close()
+
+    def _abort_multipart_upload_sync(self, key: str, upload_id: str) -> None:
+        """Abort multipart upload synchronously. Must be called from an executor job."""
+        client = self._create_sync_client()
+        try:
+            client.abort_multipart_upload(
+                Bucket=self._bucket,
+                Key=key,
+                UploadId=upload_id,
+            )
+        finally:
+            client.close()
 
     @handle_boto_errors
     async def async_delete_backup(
@@ -312,12 +435,27 @@ class S3BackupAgent(BackupAgent):
         tar_filename, metadata_filename = suggested_filenames(backup, self._prefix)
 
         # Delete both the backup file and its metadata file
-        async with self._create_client() as client:
-            await client.delete_object(Bucket=self._bucket, Key=tar_filename)
-            await client.delete_object(Bucket=self._bucket, Key=metadata_filename)
+        await self.hass.async_add_executor_job(
+            self._delete_backup_objects_sync,
+            tar_filename,
+            metadata_filename,
+        )
 
         # Reset cache after successful deletion
-        self._cache_expiration = time()
+        self._invalidate_cache()
+
+    def _delete_backup_objects_sync(
+        self,
+        tar_filename: str,
+        metadata_filename: str,
+    ) -> None:
+        """Delete backup objects synchronously. Must be called from an executor job."""
+        client = self._create_sync_client()
+        try:
+            client.delete_object(Bucket=self._bucket, Key=tar_filename)
+            client.delete_object(Bucket=self._bucket, Key=metadata_filename)
+        finally:
+            client.close()
 
     @handle_boto_errors
     async def async_list_backups(self, **kwargs: Any) -> list[AgentBackup]:
@@ -347,42 +485,61 @@ class S3BackupAgent(BackupAgent):
         if time() <= self._cache_expiration:
             return self._backup_cache
 
-        backups = {}
-        async with self._create_client() as client:
-            response = await client.list_objects_v2(
-                Bucket=self._bucket, Prefix=self._prefix
-            )
-
-            # Filter for metadata files only
-            metadata_files = [
-                obj
-                for obj in response.get("Contents", [])
-                if obj["Key"].endswith(".metadata.json")
-            ]
-
-            for metadata_file in metadata_files:
-                try:
-                    # Download and parse metadata file
-                    metadata_response = await client.get_object(
-                        Bucket=self._bucket, Key=metadata_file["Key"]
-                    )
-                    metadata_content = await metadata_response["Body"].read()
-                    metadata_json = json.loads(metadata_content)
-                except (BotoCoreError, json.JSONDecodeError) as err:
-                    _LOGGER.warning(
-                        "Failed to process metadata file %s: %s",
-                        metadata_file["Key"],
-                        err,
-                    )
-                    continue
-                # If the user has no addons backed up, set this to an empty list
-                # Should fix #18
-                if "addons" not in metadata_json:
-                    metadata_json["addons"] = []
-                backup = AgentBackup.from_dict(metadata_json)
-                backups[backup.backup_id] = backup
-
-        self._backup_cache = backups
+        self._backup_cache = await self.hass.async_add_executor_job(
+            self._list_backups_sync
+        )
         self._cache_expiration = time() + CACHE_TTL
 
         return self._backup_cache
+
+    def _invalidate_cache(self) -> None:
+        """Invalidate cached backup metadata after remote changes."""
+        self._backup_cache = {}
+        self._cache_expiration = 0
+
+    def _list_backups_sync(self) -> dict[str, AgentBackup]:
+        """List backups synchronously. Must be called from an executor job."""
+        backups: dict[str, AgentBackup] = {}
+        client = self._create_sync_client()
+        try:
+            list_kwargs = {"Bucket": self._bucket}
+            if self._prefix:
+                list_kwargs["Prefix"] = self._prefix
+            paginator = client.get_paginator("list_objects_v2")
+
+            for page in paginator.paginate(**list_kwargs):
+                metadata_files = [
+                    obj
+                    for obj in page.get("Contents", [])
+                    if obj["Key"].endswith(".metadata.json")
+                ]
+
+                for metadata_file in metadata_files:
+                    try:
+                        metadata_json = self._read_metadata_sync(
+                            client, metadata_file["Key"]
+                        )
+                    except (BotoCoreError, ClientError, json.JSONDecodeError) as err:
+                        _LOGGER.warning(
+                            "Failed to process metadata file %s: %s",
+                            metadata_file["Key"],
+                            err,
+                        )
+                        continue
+                    if "addons" not in metadata_json:
+                        metadata_json["addons"] = []
+                    backup = AgentBackup.from_dict(metadata_json)
+                    backups[backup.backup_id] = backup
+        finally:
+            client.close()
+
+        return backups
+
+    def _read_metadata_sync(self, client: Any, key: str) -> dict[str, Any]:
+        """Read backup metadata synchronously and close the response body."""
+        metadata_response = client.get_object(Bucket=self._bucket, Key=key)
+        body = metadata_response["Body"]
+        try:
+            return json.loads(body.read())
+        finally:
+            body.close()

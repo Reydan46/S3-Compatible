@@ -1,0 +1,70 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "Бакет уже настроен для этого endpoint"
+    },
+    "error": {
+      "cannot_connect": "Не удалось подключиться к endpoint",
+      "invalid_bucket_name": "Некорректное имя бакета",
+      "invalid_credentials": "Бакет недоступен с указанными access key ID и secret access key",
+      "invalid_endpoint_url": "Некорректный endpoint URL. Укажите endpoint S3 API без имени бакета.",
+      "unknown": "Неожиданная ошибка"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "access_key_id": "Access key ID",
+          "bucket": "Имя бакета",
+          "endpoint_url": "Endpoint URL",
+          "addressing_style": "Стиль адресации",
+          "secret_access_key": "Secret access key",
+          "region": "Регион",
+          "prefix": "Префикс",
+          "verify": "Путь к PEM-файлу CA"
+        },
+        "data_description": {
+          "access_key_id": "Access key ID для S3 API.",
+          "bucket": "Бакет должен уже существовать и быть доступен с указанными ключами. Не добавляйте имя бакета в endpoint URL.",
+          "endpoint_url": "URL endpoint S3 API, например https://s3.example.com. Не добавляйте имя бакета в URL. См. [Boto3 Session]({boto3_docs_url}) и [AWS S3 endpoints]({aws_s3_docs_url}).",
+          "addressing_style": "Используйте path для провайдеров вроде Garage, где URL имеет вид endpoint/bucket/key. Используйте virtual для bucket.endpoint/key. Auto оставляет выбор botocore.",
+          "secret_access_key": "Secret access key для S3 API.",
+          "region": "Регион для подписи S3-запросов. Для многих self-hosted провайдеров подходит us-east-1 или значение провайдера.",
+          "prefix": "Необязательный префикс ключей внутри бакета, например homeassistant/. Это не URL-путь, он не должен начинаться с /.",
+          "verify": "Необязательный путь к PEM-файлу CA для пользовательских TLS-сертификатов. Оставьте пустым для системного хранилища доверенных CA."
+        },
+        "title": "Добавить S3-совместимый бакет для бэкапов"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "addressing_style": "Стиль адресации",
+          "prefix": "Префикс",
+          "verify": "Путь к PEM-файлу CA"
+        },
+        "data_description": {
+          "addressing_style": "Используйте path для провайдеров вроде Garage, где URL имеет вид endpoint/bucket/key. Используйте virtual для bucket.endpoint/key. Auto оставляет выбор botocore.",
+          "prefix": "Необязательный префикс ключей внутри бакета, например homeassistant/. Это не URL-путь, он не должен начинаться с /.",
+          "verify": "Необязательный путь к PEM-файлу CA для пользовательских TLS-сертификатов. Оставьте пустым для системного хранилища доверенных CA."
+        },
+        "title": "Параметры S3-совместимых бэкапов"
+      }
+    }
+  },
+  "exceptions": {
+    "cannot_connect": {
+      "message": "Не удалось подключиться к endpoint"
+    },
+    "invalid_bucket_name": {
+      "message": "Некорректное имя бакета"
+    },
+    "invalid_credentials": {
+      "message": "Бакет недоступен с указанными access key ID и secret access key."
+    },
+    "invalid_endpoint_url": {
+      "message": "Некорректный endpoint URL"
+    }
+  }
+}
